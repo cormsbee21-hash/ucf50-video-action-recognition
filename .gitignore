@@ -1,0 +1,11 @@
+﻿__pycache__/
+*.py[cod]
+*.class
+.pytest_cache/
+venv/
+.venv/
+*.pt
+*.pth
+UCF50/
+UCF50.rar
+wandb/
