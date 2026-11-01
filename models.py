@@ -89,7 +89,8 @@ class LRCN(nn.Module):
         self.base_model = base_cnn
 
         # Define the LSTM to process the sequence of frame features.
-        self.rnn = nn.LSTM(num_features, hidden_size, n_layers)
+        # self.rnn = nn.LSTM(num_features, hidden_size, n_layers)
+        self.rnn = nn.LSTM(num_features, hidden_size, n_layers, batch_first=True)        
         
         # Define dropout for regularization.
         self.dropout = nn.Dropout(dropout_rate)
@@ -116,19 +117,19 @@ class LRCN(nn.Module):
         """
         bs, ts, c, h, w = x.shape  # batch_size, time_steps, channels, height, width
         
-        # Process the first frame separately to initialize the LSTM hidden and cell states.
-        idx = 0
-        y = self.base_model(x[:, idx])
-        _, (hn, cn) = self.rnn(y.unsqueeze(1))
-        
-        # Iterate over the remaining frames, feeding each frame's features into the LSTM.
-        for idx in range(1, ts):
-            y = self.base_model(x[:, idx])
-            out, (hn, cn) = self.rnn(y.unsqueeze(1), (hn, cn))
-        
-        # Apply dropout to the output of the final time step.
-        out = self.dropout(out[:, -1])
-        
-        # Pass the final output through the fully-connected layer to get class logits.
-        out = self.fc(out)
-        return out
+        # Fold time steps into batch dimension to extract CNN features in parallel
+        c_in = x.view(bs * ts, c, h, w)
+        cnn_features = self.base_model(c_in)  # Shape: (bs * ts, num_features)
+
+        # Reshape back to sequence for LSTM: (batch_size, time_steps, num_features)
+        r_in = cnn_features.view(bs, ts, -1)
+
+        # Process full sequence through LSTM
+        r_out, _ = self.rnn(r_in)  # Shape: (batch_size, time_steps, hidden_size)
+
+        # Take output of the final time step (original baseline behavior)
+        last_step_out = self.dropout(r_out[:, -1])
+
+        # Final classification logits
+        logits = self.fc(last_step_out)
+        return logits

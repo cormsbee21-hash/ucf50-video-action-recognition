@@ -38,6 +38,8 @@ from models import LRCN
 from train import train
 from test import test, get_test_report, get_confusion_matrix
 
+import wandb #added weight and bias for logging
+
 def args_parser():
     """
     Parse command-line arguments for configuring the video classification training or evaluation.
@@ -109,6 +111,13 @@ def main(args):
     Args:
         args (argparse.Namespace): Parsed command-line arguments.
     """
+    wandb.init(
+        project="ucf50-video-action-recognition",
+        name=f"{args.model_type}-{args.cnn_backbone}-fpv{args.fr_per_vid}-bs{args.batch_size}",
+        config=vars(args)
+    )
+    # Added weight and bias for logging
+       
     # Dataset parameters
     frame_dir = args.frame_dir
     tr_size = args.train_size
@@ -159,7 +168,7 @@ def main(args):
         # Define the loss function, optimizer, and learning rate scheduler
         loss_func = nn.CrossEntropyLoss(reduction='sum')
         opt = optim.Adam(model.parameters(), lr=learning_rate)
-        lr_scheduler = ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=5, verbose=1)
+        lr_scheduler = ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=5)
         os.makedirs("./models", exist_ok=True)
         optim_model_dir = './models'
 
@@ -189,7 +198,9 @@ def main(args):
 
     else:
         raise ValueError('The mode argument must be either "train" or "eval".')
-
+    
+    wandb.finish()
+    
 if __name__ == "__main__":
     args = args_parser()
     main(args)

@@ -18,6 +18,7 @@ import os
 import copy
 from tqdm import tqdm
 import torch
+import wandb # added weight and bias for logging
 
 def train(dataloaders, model, criterion, optimizer, scheduler, device, optim_model_wts_dir, n_epochs=30):
     """
@@ -76,10 +77,19 @@ def train(dataloaders, model, criterion, optimizer, scheduler, device, optim_mod
 
         # Update learning rate based on validation loss
         scheduler.step(val_loss)
-        if current_lr != get_learning_rate(optimizer):
-            print('Loading best model weights!')
-            model.load_state_dict(best_model_wts)
-
+        # if current_lr != get_learning_rate(optimizer):
+        #     print('Loading best model weights!')
+        #     model.load_state_dict(best_model_wts)
+        if wandb.run is not None:
+            wandb.log({
+                "epoch": epoch + 1,
+                "train/loss": train_loss,
+                "train/accuracy": train_accuracy,
+                "val/loss": val_loss,
+                "val/accuracy": val_accuracy,
+                "learning_rate": current_lr
+            })
+            
         print("train loss: {:.6f}, val loss: {:.6f}, accuracy: {:.2f}".format(train_loss, val_loss, 100*val_accuracy))
         print("-" * 60)
         print()
@@ -164,10 +174,12 @@ def get_epoch_loss(model, criterion, dataloader, device, optimizer=None):
 
     for x_batch, y_batch in tqdm(dataloader):
         x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+        batch_size = x_batch.size(0)
+
         output = model(x_batch)
         batch_loss, n_batch_correct_preds = get_batch_loss(criterion, output, y_batch, optimizer)
 
-        running_loss += batch_loss
+        running_loss += batch_loss * batch_size
         running_total_correct_preds += n_batch_correct_preds
 
     loss = running_loss / float(len_dataset)

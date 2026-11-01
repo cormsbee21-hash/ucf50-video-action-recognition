@@ -1,11 +1,42 @@
-﻿__pycache__/
+﻿# Python bytecode & cache
+__pycache__/
 *.py[cod]
-*.class
+*$py.class
 .pytest_cache/
+
+# Virtual environments
 venv/
 .venv/
+env/
+.env
+
+# Model weights & training checkpoints
 *.pt
 *.pth
+*.ckpt
+optim_model_wts/
+checkpoints/
+
+# Raw video dataset & extracted frames
+data/
 UCF50/
-UCF50.rar
+UCF50_frames/
+*.rar
+*.zip
+*.tar.gz
+*.avi
+*.mp4
+*.jpg
+*.jpeg
+*.png
+
+# Weights & Biases local files
 wandb/
+
+# IDE & Editor settings
+.vscode/
+.idea/
+
+# OS specific files
+.DS_Store
+Thumbs.db

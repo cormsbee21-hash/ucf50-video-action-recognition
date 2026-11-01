@@ -20,6 +20,8 @@ import glob
 from tqdm import tqdm
 import numpy as np
 from sklearn.model_selection import StratifiedShuffleSplit
+import re
+from sklearn.model_selection import GroupShuffleSplit
 
 
 class VideoDataset(Dataset):
@@ -101,13 +103,22 @@ def load_dataset(frame_dir):
             vid_dataset[vid_path] = label_dict[vid_cat]
     return vid_dataset, label_dict
 
+def extract_group_id(path_str):
+    """
+    Extract a unique group ID (e.g. 'BaseballPitch_g01') from the video path
+    to ensure no recording session leaks across splits.
+    """
+    clip_name = os.path.basename(os.path.normpath(path_str))
+    category_name = os.path.basename(os.path.dirname(os.path.normpath(path_str)))
+    match = re.search(r'_g(\d+)', clip_name)
+    group_num = match.group(1) if match else 'g00'
+    return f"{category_name}_{group_num}"
+
 
 def dataset_split(vid_dataset, tr_ratio, ts_ratio, seed=0):
     """
-    Split the dataset into training, validation, and test sets using stratified sampling.
-    
-    This function uses StratifiedShuffleSplit to ensure that each split has a representative
-    distribution of classes.
+    Split the dataset into training, validation, and test sets using group-aware splitting.
+    Guarantees that no video group (g01-g25) appears across multiple splits.
     
     Args:
         vid_dataset (dict): Dictionary mapping video paths to labels.
@@ -120,30 +131,36 @@ def dataset_split(vid_dataset, tr_ratio, ts_ratio, seed=0):
             - tr_dataset (list): List of (video_path, label) tuples for the training set.
             - val_dataset (list): List of (video_path, label) tuples for the validation set.
             - ts_dataset (list): List of (video_path, label) tuples for the test set.
+
+
     """
-    vid_paths = np.array([vid_path for vid_path in vid_dataset.keys()])
-    vid_labels = np.array([vid_label for vid_label in vid_dataset.values()])
-    print('Splitting train/validation/test datasets....')
+    vid_paths = np.array(list(vid_dataset.keys()))
+    vid_labels = np.array(list(vid_dataset.values()))
+    groups = np.array([extract_group_id(p) for p in vid_paths])
 
-    # Test split using StratifiedShuffleSplit
-    ts_spliter = StratifiedShuffleSplit(n_splits=1, test_size=ts_ratio, random_state=seed)
-    for tr_val_idx, ts_idx in ts_spliter.split(vid_paths, vid_labels):
-        ts_paths, ts_labels = vid_paths[ts_idx], vid_labels[ts_idx]
-        tr_val_paths, tr_val_labels = vid_paths[tr_val_idx], vid_labels[tr_val_idx]
-    ts_dataset = [(ts_path, ts_label) for ts_path, ts_label in zip(ts_paths, ts_labels)]
+    print('Splitting train/validation/test datasets with Group-Aware Splitting (No Data Leak)....')
 
-    # Train/validation split
-    val_ratio = 1 - tr_ratio - ts_ratio
-    val_wt = val_ratio / (tr_ratio + val_ratio)
-    val_spliter = StratifiedShuffleSplit(n_splits=1, test_size=val_wt, random_state=seed)
-    for tr_idx, val_idx in val_spliter.split(tr_val_paths, tr_val_labels):
-        tr_paths, tr_labels = tr_val_paths[tr_idx], tr_val_labels[tr_idx]
-        val_paths, val_labels = tr_val_paths[val_idx], tr_val_labels[val_idx]
-    tr_dataset = [(tr_path, tr_label) for tr_path, tr_label in zip(tr_paths, tr_labels)]
-    val_dataset = [(val_path, val_label) for val_path, val_label in zip(val_paths, val_labels)]
+    # Step 1: Split off Test Set by group
+    gss_test = GroupShuffleSplit(n_splits=1, test_size=ts_ratio, random_state=seed)
+    train_val_idx, test_idx = next(gss_test.split(vid_paths, vid_labels, groups))
+
+    ts_dataset = [(vid_paths[i], int(vid_labels[i])) for i in test_idx]
+
+    tr_val_paths = vid_paths[train_val_idx]
+    tr_val_labels = vid_labels[train_val_idx]
+    tr_val_groups = groups[train_val_idx]
+
+    # Step 2: Split remaining data into Train and Validation by group
+    val_ratio = 1.0 - tr_ratio - ts_ratio
+    val_weight = val_ratio / (tr_ratio + val_ratio)
+
+    gss_val = GroupShuffleSplit(n_splits=1, test_size=val_weight, random_state=seed)
+    tr_idx, val_idx = next(gss_val.split(tr_val_paths, tr_val_labels, tr_val_groups))
+
+    tr_dataset = [(tr_val_paths[i], int(tr_val_labels[i])) for i in tr_idx]
+    val_dataset = [(tr_val_paths[i], int(tr_val_labels[i])) for i in val_idx]
 
     return tr_dataset, val_dataset, ts_dataset
-
 
 def collate_fn_r3d_18(batch):
     """
@@ -169,7 +186,6 @@ def collate_fn_r3d_18(batch):
     imgs_tensor = torch.transpose(imgs_tensor, 2, 1)
     labels_tensor = torch.stack(label_batch)
     return imgs_tensor, labels_tensor
-
 
 def collate_fn_rnn(batch):
     """
