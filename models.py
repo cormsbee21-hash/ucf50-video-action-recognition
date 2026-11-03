@@ -1,135 +1,118 @@
 """
 Module: models.py
 
-This module defines the LRCN (Long-term Recurrent Convolutional Network) model for video
-classification. The LRCN model combines a 2D CNN backbone (e.g., ResNet) for spatial feature
-extraction from individual frames with an LSTM to capture temporal dynamics across frames.
-An additional fully-connected layer is used to output the final class predictions.
-
-Classes:
-    Identity: A helper module that returns the input unchanged. It is used to replace the fully-connected
-              layer of the ResNet backbone.
-    LRCN: The main model that integrates the CNN backbone, an LSTM, dropout regularization, and a final
-          fully-connected layer to produce class logits.
+Defines video classification architectures for UCF50.
+Supports:
+  - 3D CNN: Inflated 3D Spatio-Temporal ResNet (R3D-18), per Module 7 Lecture Slides 70-73.
+  - LRCN: 2D ResNet-34 backbone with Bidirectional LSTM and dual temporal pooling.
 """
-
-import torch.nn as nn
+import torch
+from torch import nn
 from torchvision import models
+import torchvision.models.video as video_models
+
 
 class Identity(nn.Module):
-    """
-    A placeholder identity operator that is argument-insensitive.
-    
-    This module is used to replace the fully-connected (fc) layer in the ResNet backbone,
-    effectively making the backbone output the raw features before classification.
-    
-    Example:
-        >>> identity = Identity()
-        >>> output = identity(input_tensor)
-    """
+    """Placeholder identity operator replacing the base CNN classification head."""
     def __init__(self):
-        super(Identity, self).__init__()
+        super().__init__()
+
+    def forward(self, x):
+        """Pass input through unchanged."""
+        return x
+
+
+class VideoResNet3D(nn.Module):
+    """
+    Spatio-temporal 3D CNN (R3D-18) pretrained on Kinetics-400.
+    Directly extracts spatio-temporal features across (C, T, H, W) volumes.
+    Lecture Reference: Module 7 Slides 70-73 (Inflating 2D Networks to 3D).
+    """
+    def __init__(self, n_classes=50, pretrained=True):
+        super().__init__()
+        weights = video_models.R3D_18_Weights.DEFAULT if pretrained else None
+        self.backbone = video_models.r3d_18(weights=weights)
+
+        # Freeze early spatio-temporal layers (conv1 through layer3)
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+        # Adapt high-level layer4 spatio-temporal residual block
+        for param in self.backbone.layer3.parameters():
+            param.requires_grad = True
+        for param in self.backbone.layer4.parameters():
+            param.requires_grad = True
+
+        in_feats = self.backbone.fc.in_features
+        self.backbone.fc = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(in_feats, n_classes)
+        )
 
     def forward(self, x):
         """
-        Forward pass that returns the input as is.
-        
-        Args:
-            x (Tensor): Input tensor.
-        
-        Returns:
-            Tensor: The same tensor x.
+        Input x: (batch_size, channels, time_steps, height, width) from train_val_dloaders
         """
-        return x
+        return self.backbone(x)
+
 
 class LRCN(nn.Module):
     """
-    LRCN (Long-term Recurrent Convolutional Network) for video classification.
-    
-    This model uses a ResNet backbone as a 2D CNN to extract spatial features from each video frame.
-    An LSTM network is then used to model the temporal dynamics across the sequence of frame features.
-    Dropout is applied before the final fully-connected layer that produces class logits.
-
-    Args:
-        hidden_size (int): Number of features in the hidden state of the LSTM.
-        n_layers (int): Number of recurrent layers in the LSTM.
-        dropout_rate (float): Dropout rate applied before the final classification layer.
-        n_classes (int): Number of output classes.
-        pretrained (bool, optional): If True, uses a ResNet model pretrained on ImageNet. Default is True.
-        cnn_model (str, optional): Specifies the ResNet variant to use as the backbone.
-                                   Options: 'resnet18', 'resnet34', 'resnet50', 'resnet101', 'resnet152'.
-                                   Default is 'resnet34'.
-    
-    Raises:
-        ValueError: If the specified cnn_model is not supported.
+    Enhanced LRCN integrating a 2D ResNet backbone with a Bidirectional LSTM
+    and dual temporal pooling (Average + Max).
     """
-    def __init__(self, hidden_size, n_layers, dropout_rate, n_classes, pretrained=True, cnn_model='resnet34'):
-        super(LRCN, self).__init__()
+    def __init__(self, hidden_size, n_layers, dropout_rate, n_classes, **kwargs):
+        super().__init__()
+        pretrained = kwargs.get('pretrained', True)
+        cnn_model = kwargs.get('cnn_model', 'resnet34')
 
-        # Set up the ResNet backbone as a 2D CNN feature extractor.
         if cnn_model == 'resnet18':
-            base_cnn = models.resnet18(pretrained=pretrained)
-        elif cnn_model == 'resnet34':
-            base_cnn = models.resnet34(pretrained=pretrained)
+            weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+            base_cnn = models.resnet18(weights=weights)
         elif cnn_model == 'resnet50':
-            base_cnn = models.resnet50(pretrained=pretrained)
-        elif cnn_model == 'resnet101':
-            base_cnn = models.resnet101(pretrained=pretrained)
-        elif cnn_model == 'resnet152':
-            # Note: This example uses resnet34 for resnet152 option as a placeholder.
-            base_cnn = models.resnet34(pretrained=pretrained)
+            weights = models.ResNet50_Weights.DEFAULT if pretrained else None
+            base_cnn = models.resnet50(weights=weights)
         else:
-            raise ValueError('The input CNN backbone is not supported, please choose a valid ResNet variant.')
+            weights = models.ResNet34_Weights.DEFAULT if pretrained else None
+            base_cnn = models.resnet34(weights=weights)
 
-        # Retrieve the number of features output by the CNN's original fully-connected layer.
         num_features = base_cnn.fc.in_features
-        
-        # Replace the original fc layer with an identity mapping so that raw features are returned.
         base_cnn.fc = Identity()
         self.base_model = base_cnn
 
-        # Define the LSTM to process the sequence of frame features.
-        # self.rnn = nn.LSTM(num_features, hidden_size, n_layers)
-        self.rnn = nn.LSTM(num_features, hidden_size, n_layers, batch_first=True)        
-        
-        # Define dropout for regularization.
+        # Freeze early layers, keep layer3 and layer4 trainable
+        for param in self.base_model.parameters():
+            param.requires_grad = False
+        for param in self.base_model.layer3.parameters():
+            param.requires_grad = True
+        for param in self.base_model.layer4.parameters():
+            param.requires_grad = True
+
+        self.rnn = nn.LSTM(
+            num_features,
+            hidden_size,
+            n_layers,
+            batch_first=True,
+            bidirectional=True
+        )
+
         self.dropout = nn.Dropout(dropout_rate)
-        
-        # Final fully-connected layer to produce logits for each class.
-        self.fc = nn.Linear(hidden_size, n_classes)
+        self.fc = nn.Linear(hidden_size * 4, n_classes)
 
     def forward(self, x):
         """
-        Forward pass for the LRCN model.
-        
-        The input tensor x is expected to have the shape:
-            (batch_size, time_steps, channels, height, width)
-        
-        For each time step (frame), the CNN backbone extracts features. These features are then
-        passed through the LSTM sequentially. The output from the last time step is then passed
-        through dropout and the final fully-connected layer to produce the class logits.
-
-        Args:
-            x (Tensor): Input tensor of shape (batch_size, time_steps, channels, height, width).
-
-        Returns:
-            Tensor: Output logits for each sample in the batch with shape (batch_size, n_classes).
+        Extract spatial representations per frame and model sequence dynamics with BiLSTM.
         """
-        bs, ts, c, h, w = x.shape  # batch_size, time_steps, channels, height, width
-        
-        # Fold time steps into batch dimension to extract CNN features in parallel
-        c_in = x.view(bs * ts, c, h, w)
-        cnn_features = self.base_model(c_in)  # Shape: (bs * ts, num_features)
+        bs, ts, c, h, w = x.shape
+        self.base_model.eval()
 
-        # Reshape back to sequence for LSTM: (batch_size, time_steps, num_features)
+        c_in = x.reshape(bs * ts, c, h, w)
+        cnn_features = self.base_model(c_in)
         r_in = cnn_features.view(bs, ts, -1)
 
-        # Process full sequence through LSTM
-        r_out, _ = self.rnn(r_in)  # Shape: (batch_size, time_steps, hidden_size)
+        r_out, _ = self.rnn(r_in)
+        avg_pool = torch.mean(r_out, dim=1)
+        max_pool = torch.amax(r_out, dim=1)
+        pooled = torch.cat([avg_pool, max_pool], dim=1)
 
-        # Take output of the final time step (original baseline behavior)
-        last_step_out = self.dropout(r_out[:, -1])
-
-        # Final classification logits
-        logits = self.fc(last_step_out)
-        return logits
+        out = self.dropout(pooled)
+        return self.fc(out)

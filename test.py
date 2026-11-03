@@ -1,95 +1,91 @@
 """
 Module: test.py
 
-This module provides functions for evaluating a video classification model on test data.
-It includes functions to compute predictions and accuracy, generate a detailed classification report,
-and compute a multilabel confusion matrix for all classes.
-
-Functions:
-    - test: Evaluates the model on a test DataLoader and returns the ground truth labels,
-      predicted labels, and overall accuracy.
-    - get_test_report: Generates a classification report using scikit-learn's classification_report.
-    - get_confusion_matrix: Computes a multilabel confusion matrix for each class.
+This module provides functions for evaluating trained video classification models.
+It includes functions to run model inference on a test dataset, compute accuracy,
+generate classification reports, and calculate confusion matrices.
 """
 
-import torch
 from tqdm import tqdm
+import torch
 from sklearn.metrics import classification_report, multilabel_confusion_matrix
 
-def test(model, dataloader, device):
+
+def test(model, test_dataloader, device):
     """
-    Evaluate the model on the test dataset and compute overall accuracy.
-    
-    This function sets the model to evaluation mode and processes the test data
-    from the provided DataLoader. It computes predictions for each batch, counts the number
-    of correct predictions, and accumulates the true and predicted labels.
-    
+    Evaluate the model on the test dataset.
+
     Args:
-        model (torch.nn.Module): The trained video classification model.
-        dataloader (torch.utils.data.DataLoader): DataLoader containing the test dataset.
-        device (torch.device): The device (CPU or GPU) on which to perform evaluation.
-    
+        model (torch.nn.Module): Trained model to evaluate.
+        test_dataloader (DataLoader): DataLoader for test data.
+        device (torch.device): Device to run evaluation on.
+
     Returns:
         tuple: (targets, outputs, accuracy)
-            - targets (list): Ground truth labels for all samples.
-            - outputs (list): Predicted labels for all samples.
-            - accuracy (float): Overall accuracy computed as the ratio of correct predictions
-                                to the total number of samples.
+            - targets (list): Ground truth labels.
+            - outputs (list): Predicted class labels.
+            - accuracy (float): Test set accuracy.
     """
+    running_corrects = 0
+    targets = []
+    outputs = []
+
     model.eval()
     with torch.no_grad():
-        total_correct_preds = 0.0
-        len_dataset = len(dataloader.dataset)
-        targets, outputs = [], []
-        for x_batch, y_batch in tqdm(dataloader):
-            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+        for x_batch, y_batch in tqdm(test_dataloader):
+            x_batch = x_batch.to(device)
+            y_batch = y_batch.to(device)
+
             output = model(x_batch)
-            pred = output.argmax(dim=1, keepdim=True)
-            correct_preds = pred.eq(y_batch.view_as(pred)).sum().item()
-            total_correct_preds += correct_preds
-            outputs.extend(pred.view(-1).detach().cpu().numpy().tolist())
-            targets.extend(y_batch.detach().cpu().numpy().tolist())
-        
-        accuracy = total_correct_preds / float(len_dataset)
-    
+            preds = output.argmax(dim=1)
+
+            running_corrects += preds.eq(y_batch).sum().item()
+            targets.extend(y_batch.tolist())
+            outputs.extend(preds.tolist())
+
+    accuracy = running_corrects / float(len(test_dataloader.dataset))
     return targets, outputs, accuracy
 
-def get_test_report(target, output, target_names):
+
+def get_test_report(targets, outputs, all_cats):
     """
-    Generate a detailed classification report based on test results.
-    
-    This function uses scikit-learn's classification_report to produce a dictionary
-    containing precision, recall, F1-score, and support for each class.
-    
+    Generate a text classification report showing precision, recall, and F1-score.
+
     Args:
-        target (list): Ground truth labels.
-        output (list): Predicted labels.
-        target_names (list): List of class names corresponding to the labels.
-    
+        targets (list): Ground truth class labels.
+        outputs (list): Predicted class labels.
+        all_cats (list): List of all class names.
+
     Returns:
-        dict: A classification report as a dictionary.
+        dict: A dictionary containing precision, recall, and f1-scores for each class.
     """
-    return classification_report(target, output, output_dict=True, target_names=target_names)
+    report = classification_report(
+        targets,
+        outputs,
+        target_names=all_cats,
+        output_dict=True
+    )
+    return report
+
 
 def get_confusion_matrix(targets, outputs, labels_dict, all_cats):
     """
-    Compute a multilabel confusion matrix for each class.
-    
-    This function converts numeric labels to their corresponding class names using the provided
-    labels_dict, then computes a multilabel confusion matrix for each class using scikit-learn.
-    
+    Calculate multilabel confusion matrices for each class.
+
     Args:
-        targets (list): Ground truth numeric labels.
-        outputs (list): Predicted numeric labels.
-        labels_dict (dict): Dictionary mapping class names to numeric labels.
+        targets (list): Ground truth class labels.
+        outputs (list): Predicted class labels.
+        labels_dict (dict): Dictionary mapping class names to integer labels.
         all_cats (list): List of all class names.
-    
+
     Returns:
-        dict: A dictionary where keys are class names and values are the corresponding confusion matrices.
+        dict: A dictionary where keys are class names and values are the
+        corresponding confusion matrices.
     """
-    # Create an inverse mapping from numeric label to class name
     inv_labels_dict = {label: cat for cat, label in labels_dict.items()}
     target_cats = [inv_labels_dict[target] for target in targets]
     output_cats = [inv_labels_dict[output] for output in outputs]
-    confusion_mat = multilabel_confusion_matrix(target_cats, output_cats, labels=all_cats)
-    return {label: mat for label, mat in zip(all_cats, confusion_mat)}
+    confusion_mat = multilabel_confusion_matrix(
+        target_cats, output_cats, labels=all_cats
+    )
+    return dict(zip(all_cats, confusion_mat))

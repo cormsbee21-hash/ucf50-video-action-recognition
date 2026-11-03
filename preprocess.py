@@ -1,83 +1,126 @@
 """
-Preprocess UCF50 video clips into uniformly sampled JPEG frames.
+Module: preprocess.py
+
+Extracts uniformly sampled frames from raw UCF50 video files (.avi) and stores
+them as JPEG images organized by action class and video identity.
+Supports multi-worker parallel execution via ProcessPoolExecutor with a clean progress bar.
 """
 
-import os
-import glob
 import argparse
 from concurrent.futures import ProcessPoolExecutor
+import os
 import cv2
 from tqdm import tqdm
+from utils import get_frames, store_frames
+
+# Prevent OpenCV internal threads from contending with ProcessPoolExecutor workers
+cv2.setNumThreads(0)
 
 
-def extract_frames_from_video(video_path: str, output_clip_dir: str, num_frames: int = 16) -> None:
+def parse_arguments():
+    """Parse command-line arguments for video preprocessing."""
+    parser = argparse.ArgumentParser(
+        description="Extract and store frames from UCF50 video dataset."
+    )
+    parser.add_argument(
+        "--src_dir",
+        type=str,
+        default="data/UCF50",
+        help="Root path containing UCF50 raw action class video folders."
+    )
+    parser.add_argument(
+        "--dest_dir",
+        type=str,
+        default="data/UCF50_frames",
+        help="Destination directory to save extracted frame sequences."
+    )
+    parser.add_argument(
+        "--n_frames",
+        type=int,
+        default=32,
+        help="Number of frames to extract per video (default: 32)."
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=8,
+        help="Number of parallel worker processes (default: 8)."
+    )
+    return parser.parse_args()
+
+
+def process_video_task(task_args):
     """
-    Uniformly sample and write `num_frames` from a video to `output_clip_dir`.
-    """
-    os.makedirs(output_clip_dir, exist_ok=True)
+    Worker task to extract and write frames for a single video.
 
-    # Check if already processed to allow resuming
-    existing_frames = glob.glob(os.path.join(output_clip_dir, "*.jpg"))
-    if len(existing_frames) >= num_frames:
+    Args:
+        task_args (tuple): (vid_path, out_dir, n_frames)
+    """
+    vid_path, out_dir, n_frames = task_args
+    os.makedirs(out_dir, exist_ok=True)
+
+    existing_frames = [f for f in os.listdir(out_dir) if f.endswith(".jpg")]
+    if len(existing_frames) >= n_frames:
         return
 
-    cap = cv2.VideoCapture(video_path)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    if total_frames <= 0:
-        cap.release()
-        return
-
-    # Calculate uniform indices across the clip
-    step = max(1, total_frames // num_frames)
-    target_indices = {min(i * step, total_frames - 1) for i in range(num_frames)}
-
-    frame_idx = 0
-    saved_count = 0
-    while cap.isOpened() and saved_count < num_frames:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if frame_idx in target_indices:
-            frame_filename = os.path.join(output_clip_dir, f"frame_{saved_count:02d}.jpg")
-            # Write standard JPEG
-            cv2.imwrite(frame_filename, frame)
-            saved_count += 1
-        frame_idx += 1
-
-    cap.release()
+    frames, _ = get_frames(vid_path, n_frames=n_frames)
+    if frames:
+        store_frames(frames, out_dir)
 
 
-def process_clip(args_tuple):
-    video_path, output_clip_dir, num_frames = args_tuple
-    extract_frames_from_video(video_path, output_clip_dir, num_frames)
+def preprocess_dataset(src_dir, dest_dir, n_frames=32, num_workers=8):
+    """
+    Traverse action category directories and process all video files concurrently.
+
+    Args:
+        src_dir (str): Source dataset directory containing class subfolders.
+        dest_dir (str): Destination root directory for extracted frames.
+        n_frames (int): Target frame count per video.
+        num_workers (int): Number of parallel processes.
+    """
+    if not os.path.exists(src_dir):
+        raise FileNotFoundError(f"Source video directory not found: {src_dir}")
+
+    classes = sorted(entry.name for entry in os.scandir(src_dir) if entry.is_dir())
+    print(f"Discovered {len(classes)} action categories in {src_dir}.")
+    print(f"Extracting {n_frames} frames/video to {dest_dir} across {num_workers} workers...")
+
+    tasks = []
+    for cls_name in classes:
+        cls_src_path = os.path.join(src_dir, cls_name)
+        cls_dest_path = os.path.join(dest_dir, cls_name)
+
+        vid_files = sorted(
+            f for f in os.listdir(cls_src_path)
+            if f.lower().endswith((".avi", ".mp4", ".mkv"))
+        )
+        for vid_file in vid_files:
+            vid_base = os.path.splitext(vid_file)[0]
+            vid_path = os.path.join(cls_src_path, vid_file)
+            vid_out_dir = os.path.join(cls_dest_path, vid_base)
+            tasks.append((vid_path, vid_out_dir, n_frames))
+
+    print(f"Total videos queued: {len(tasks)}")
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        for _ in tqdm(
+            executor.map(process_video_task, tasks),
+            total=len(tasks),
+            desc="Extracting UCF50 Frames",
+            unit="vid",
+            dynamic_ncols=True
+        ):
+            pass
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract video frames for UCF50")
-    parser.add_argument("--src_dir", type=str, default="data/UCF50", help="Root folder of raw UCF50 videos")
-    parser.add_argument("--dest_dir", type=str, default="data/UCF50_frames", help="Destination folder for extracted frames")
-    parser.add_argument("--fr_per_vid", type=int, default=16, help="Frames to extract per video")
-    parser.add_argument("--workers", type=int, default=8, help="Number of parallel worker processes")
-    args = parser.parse_args()
-
-    # Find all .avi video files
-    video_files = glob.glob(os.path.join(args.src_dir, "*", "*.avi"))
-    print(f"Discovered {len(video_files)} video clips across UCF50.")
-
-    tasks = []
-    for vid_path in video_files:
-        # Expected structure: data/UCF50/<Action_Class>/v_<Action>_gXX_cYY.avi
-        category = os.path.basename(os.path.dirname(vid_path))
-        clip_name = os.path.splitext(os.path.basename(vid_path))[0]
-        output_dir = os.path.join(args.dest_dir, category, clip_name)
-        tasks.append((vid_path, output_dir, args.fr_per_vid))
-
-    print(f"Extracting {args.fr_per_vid} frames per clip into '{args.dest_dir}' using {args.workers} workers...")
-    with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        list(tqdm(executor.map(process_clip, tasks), total=len(tasks), desc="Processing Videos"))
-
-    print("Preprocessing complete!")
+    """CLI orchestrator for dataset preprocessing."""
+    args = parse_arguments()
+    preprocess_dataset(
+        args.src_dir,
+        args.dest_dir,
+        n_frames=args.n_frames,
+        num_workers=args.num_workers
+    )
 
 
 if __name__ == "__main__":
