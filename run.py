@@ -3,9 +3,9 @@ Module: run.py
 
 Main entry point for training and evaluating video classification models on UCF50.
 Supports:
-  - Architecture switching: 3D CNN (R3D-18) vs. LRCN (2D ResNet-34 + BiLSTM)
+  - Architecture switching: Factorized 3D CNN (R(2+1)D-18) vs. LRCN (2D ResNet-34 + BiLSTM)
   - Group-Aware Split saving & loading via splits.npy
-  - Mixed-precision training and evaluation with 3-clip consensus
+  - Mixed-precision training and evaluation with 10-clip consensus
   - Weights & Biases experiment tracking
 """
 
@@ -31,10 +31,11 @@ from video_datasets import VideoDataset, dataset_split, load_dataset
 
 
 # Enable TF32 for Ampere Tensor Cores
-torch.set_float32_matmul_precision('high')
+torch.set_float32_matmul_precision("high")
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
+
 
 def parse_arguments():
     """Parse command-line arguments."""
@@ -45,12 +46,13 @@ def parse_arguments():
     parser.add_argument("--model_type", type=str, default="lrcn", choices=["lrcn", "3dcnn"])
     parser.add_argument("--cnn_backbone", type=str, default="resnet34")
     parser.add_argument("--n_classes", type=int, default=50)
-    parser.add_argument("--fr_per_vid", type=int, default=32)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--n_epochs", type=int, default=30)
-    parser.add_argument("--learning_rate", type=float, default=2e-4)
+    parser.add_argument("--fr_per_vid", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--n_epochs", type=int, default=16)
+    parser.add_argument("--learning_rate", type=float, default=3e-4)
     parser.add_argument("--mode", type=str, default="train", choices=["train", "eval"])
     parser.add_argument("--ckpt", type=str, default=None)
+    parser.add_argument("--eval_clips", type=int, default=10)
     return parser.parse_args()
 
 
@@ -60,49 +62,66 @@ def load_or_create_splits(samples, args):
     if os.path.exists(split_cache):
         print(f"Loading cached splits from {split_cache}...")
         splits = np.load(split_cache, allow_pickle=True).item()
-        return splits['train'], splits['val'], splits['test']
+        return splits["train"], splits["val"], splits["test"]
 
     print("Generating new group-aware splits...")
     tr_s, val_s, ts_s = dataset_split(
         samples, train_size=args.train_size, test_size=args.test_size
     )
-    np.save(split_cache, {'train': tr_s, 'val': val_s, 'test': ts_s})
+    np.save(split_cache, {"train": tr_s, "val": val_s, "test": ts_s})
     return tr_s, val_s, ts_s
 
 
 def build_model(args):
-    """Instantiate model and configure parameter groups."""
+    """Instantiate model and configure parameter groups with discriminative learning rates."""
     if args.model_type == "3dcnn":
         model = VideoResNet3D(n_classes=args.n_classes, pretrained=True)
+        # Higher capacity tuning: layer3=0.25x (~7.5e-5), layer4=0.5x (~1.5e-4), fc=1.0x (3e-4)
         param_groups = [
-            {'params': model.backbone.layer3.parameters(), 'lr': args.learning_rate * 0.5},
-            {'params': model.backbone.layer4.parameters(), 'lr': args.learning_rate * 0.5},
-            {'params': model.backbone.fc.parameters(), 'lr': args.learning_rate}
+            {
+                "params": [p for p in model.backbone.layer3.parameters() if p.requires_grad],
+                "lr": args.learning_rate * 0.25
+            },
+            {
+                "params": [p for p in model.backbone.layer4.parameters() if p.requires_grad],
+                "lr": args.learning_rate * 0.5
+            },
+            {
+                "params": [p for p in model.backbone.fc.parameters() if p.requires_grad],
+                "lr": args.learning_rate
+            }
         ]
     else:
         model = LRCN(
-            hidden_size=100,
-            n_layers=1,
-            dropout_rate=0.1,
+            hidden_size=256,
+            n_layers=2,
+            dropout_rate=0.3,
             n_classes=args.n_classes,
             pretrained=True,
             cnn_model=args.cnn_backbone
         )
-        param_groups = [
-            {'params': model.base_model.layer3.parameters(), 'lr': args.learning_rate * 0.5},
-            {'params': model.base_model.layer4.parameters(), 'lr': args.learning_rate * 0.5},
-            {'params': model.rnn.parameters(), 'lr': args.learning_rate},
-            {'params': model.fc.parameters(), 'lr': args.learning_rate}
+        backbone_params = [
+            p for n, p in model.base_model.named_parameters() if p.requires_grad
         ]
+        head_params = [
+            p for n, p in model.named_parameters()
+            if not n.startswith("base_model") and p.requires_grad
+        ]
+        param_groups = [
+            {"params": backbone_params, "lr": args.learning_rate * 0.1},
+            {"params": head_params, "lr": args.learning_rate}
+        ]
+
     return model, param_groups
 
 
-def extract_temporal_clips(vid_dir, fr_per_vid, transform, model_type):
-    """Uniformly extract 3 temporal clips from a video directory."""
+def extract_temporal_clips(vid_dir, fr_per_vid, transform, model_type, num_clips=10):
+    """Extract dense, uniformly spaced temporal clips across a video duration."""
     paths = sorted(glob.glob(os.path.join(vid_dir, "*.jpg")))
     batch_clips = []
+    offsets = np.linspace(0.0, 1.0, num_clips)
 
-    for off in (0.0, 0.5, 1.0):
+    for off in offsets:
         clip_frames = []
         if len(paths) <= fr_per_vid:
             idxs = list(range(len(paths))) + [len(paths) - 1] * (fr_per_vid - len(paths))
@@ -123,20 +142,24 @@ def extract_temporal_clips(vid_dir, fr_per_vid, transform, model_type):
 
 
 def run_evaluation(args, model, test_samples, device):
-    """Evaluate holdout test set using 3-clip temporal consensus."""
+    """Evaluate holdout test set using multi-clip temporal consensus."""
     _, ts_transforms = compose_data_transforms(*transform_stats(args.model_type))
     n_correct = 0
     total = len(test_samples)
 
-    print(f"Evaluating {total} test videos with 3-clip temporal consensus...")
+    print(f"Evaluating {total} test videos with {args.eval_clips}-clip consensus...")
     model.eval()
     with torch.no_grad():
         for vid_dir, label in tqdm(test_samples):
             batch_clips = extract_temporal_clips(
-                vid_dir, args.fr_per_vid, ts_transforms, args.model_type
+                vid_dir,
+                args.fr_per_vid,
+                ts_transforms,
+                args.model_type,
+                num_clips=args.eval_clips
             ).to(device)
 
-            with autocast('cuda', enabled=device.type == 'cuda'):
+            with autocast("cuda", enabled=device.type == "cuda"):
                 logits = model(batch_clips)
                 probs = torch.softmax(logits, dim=1).mean(dim=0)
                 pred = probs.argmax().item()
@@ -166,9 +189,11 @@ def run_training_pipeline(args, model, param_groups, splits_data, device):
     opt = torch.optim.AdamW(param_groups, weight_decay=1e-3)
 
     opt_setup = {
-        "criterion": nn.CrossEntropyLoss(reduction="sum"),
+        "criterion": nn.CrossEntropyLoss(label_smoothing=0.1, reduction="sum"),
         "optimizer": opt,
-        "scheduler": ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=3, min_lr=1e-6)
+        "scheduler": ReduceLROnPlateau(
+            opt, mode="min", factor=0.5, patience=3, min_lr=1e-6
+        )
     }
     train_cfg = {
         "device": device,
