@@ -33,24 +33,23 @@ class VideoResNet3D(nn.Module):
         weights = video_models.R3D_18_Weights.DEFAULT if pretrained else None
         self.backbone = video_models.r3d_18(weights=weights)
 
-        # Freeze early spatio-temporal layers (conv1 through layer3)
+        # Freeze stem and low-to-mid spatio-temporal blocks (conv1, layer1, layer2, layer3)
         for param in self.backbone.parameters():
             param.requires_grad = False
-        # Adapt high-level layer4 spatio-temporal residual block
-        for param in self.backbone.layer3.parameters():
-            param.requires_grad = True
+
+        # Adapt high-level layer4 block to avoid destroying pretrained dynamics
         for param in self.backbone.layer4.parameters():
             param.requires_grad = True
 
         in_feats = self.backbone.fc.in_features
         self.backbone.fc = nn.Sequential(
-            nn.Dropout(0.3),
+            nn.Dropout(0.4),
             nn.Linear(in_feats, n_classes)
         )
 
     def forward(self, x):
         """
-        Input x: (batch_size, channels, time_steps, height, width) from train_val_dloaders
+        Input x: (batch_size, channels, time_steps, height, width)
         """
         return self.backbone(x)
 
@@ -60,7 +59,7 @@ class LRCN(nn.Module):
     Enhanced LRCN integrating a 2D ResNet backbone with a Bidirectional LSTM
     and dual temporal pooling (Average + Max).
     """
-    def __init__(self, hidden_size, n_layers, dropout_rate, n_classes, **kwargs):
+    def __init__(self, hidden_size=256, n_layers=2, dropout_rate=0.3, n_classes=50, **kwargs):
         super().__init__()
         pretrained = kwargs.get('pretrained', True)
         cnn_model = kwargs.get('cnn_model', 'resnet34')
@@ -79,36 +78,41 @@ class LRCN(nn.Module):
         base_cnn.fc = Identity()
         self.base_model = base_cnn
 
-        # Freeze early layers, keep layer3 and layer4 trainable
+        # Freeze early layers (conv1, bn1, layer1, layer2)
         for param in self.base_model.parameters():
             param.requires_grad = False
+
+        # Allow fine-tuning on high-level visual representations
         for param in self.base_model.layer3.parameters():
             param.requires_grad = True
         for param in self.base_model.layer4.parameters():
             param.requires_grad = True
 
         self.rnn = nn.LSTM(
-            num_features,
-            hidden_size,
-            n_layers,
+            input_size=num_features,
+            hidden_size=hidden_size,
+            num_layers=n_layers,
             batch_first=True,
             bidirectional=True
         )
 
         self.dropout = nn.Dropout(dropout_rate)
+        # Bidirectional (* 2) combined with Average + Max pooling (* 2) = hidden_size * 4
         self.fc = nn.Linear(hidden_size * 4, n_classes)
 
     def forward(self, x):
         """
         Extract spatial representations per frame and model sequence dynamics with BiLSTM.
+        Input x: (batch_size, time_steps, channels, height, width)
         """
         bs, ts, c, h, w = x.shape
-        self.base_model.eval()
 
+        # Fold time steps into batch dimension for spatial feature extraction
         c_in = x.reshape(bs * ts, c, h, w)
         cnn_features = self.base_model(c_in)
         r_in = cnn_features.view(bs, ts, -1)
 
+        # Sequence modeling across frames
         r_out, _ = self.rnn(r_in)
         avg_pool = torch.mean(r_out, dim=1)
         max_pool = torch.amax(r_out, dim=1)
